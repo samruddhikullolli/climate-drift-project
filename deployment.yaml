@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: climate-pipeline
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: climate
+  template:
+    metadata:
+      labels:
+        app: climate
+    spec:
+      containers:
+      - name: climate-pipeline
+        image: climate-pipeline:latest
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "1000m"
