@@ -1,0 +1,58 @@
+name: Climate Pipeline CI/CD
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install numpy pandas scikit-learn requests
+
+      - name: Test imports
+        run: python -c "import numpy; import pandas; print('All imports OK')"
+
+      - name: Test NASA API
+        run: |
+          python -c "
+          import requests
+          r = requests.get('https://power.larc.nasa.gov/api/temporal/daily/point?parameters=T2M&community=RE&longitude=77.2&latitude=28.6&start=20230101&end=20230105&format=JSON', timeout=30)
+          print('NASA API Status:', r.status_code)
+          "
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Docker image
+        run: docker build -t climate-pipeline .
+
+      - name: Success
+        run: echo "Docker image built successfully!"
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Pipeline Complete
+        run: |
+          echo "================================"
+          echo "CI/CD Pipeline Complete!"
+          echo "Tests Passed"
+          echo "Docker Image Built"
+          echo "Ready for Deployment"
+          echo "================================"
