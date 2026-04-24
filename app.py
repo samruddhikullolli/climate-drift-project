@@ -3,6 +3,7 @@ import random
 import warnings
 warnings.filterwarnings('ignore')
 
+import mlflow
 SEED = 42
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYTHONHASHSEED']        = str(SEED)
@@ -76,6 +77,10 @@ def fetch_nasa_power(lat=28.6, lon=77.2, start='20100101', end='20231231'):
         df  = df.replace([np.inf, -np.inf], np.nan).dropna().sort_index()
         print(f"  Live data fetched: {len(df)} days  "
               f"({df.index.min().date()} -> {df.index.max().date()})")
+        # Save data snapshot for DVC versioning
+        os.makedirs('data', exist_ok=True)
+        df.to_csv('data/climate_data.csv')
+        print("  Data snapshot saved -> data/climate_data.csv")
         return df
     except Exception as e:
         print(f"  NASA POWER API failed: {e}")
@@ -389,23 +394,10 @@ def compute_metrics(trues, preds, label=""):
 
 
 # =============================================================================
-# UPGRADE 3 — SHAP FEATURE IMPORTANCE  (FIXED — last timestep only)
+# UPGRADE 3 — SHAP FEATURE IMPORTANCE
 # =============================================================================
 
 def explain_with_shap(model, X_train, feature_names, model_type, n_samples=100):
-    """
-    SHAP explanation using the LAST TIMESTEP only.
-
-    Why last timestep?
-      - LSTM/GRU/RNN predictions are most influenced by recent context.
-      - Using last timestep: input shape becomes (samples, n_features) — 2D.
-      - Both background AND explain data are the same 2D shape → no mismatch.
-      - The predict wrapper adds back the time dimension for the model.
-
-    Viva line:
-      "For interpretability we explain the model using the latest timestep
-       features since the prediction depends most on recent temporal context."
-    """
     if not SHAP_AVAILABLE:
         print("\nSHAP not available — skipping. Run: pip install shap")
         return
@@ -417,46 +409,27 @@ def explain_with_shap(model, X_train, feature_names, model_type, n_samples=100):
     print(f"  X_train shape  : {X_train.shape}  "
           f"(samples, timesteps, features)")
 
-    # FIX 1: Extract ONLY the last timestep → shape (samples, n_features)
-    # This eliminates the (samples, 30*features) vs (samples, features) mismatch.
-    X_last = X_train[:, -1, :]           # shape: (N_train, n_features)
-
-    # FIX 2: Use a small consistent background (50 samples, same 2D shape)
+    X_last = X_train[:, -1, :]
     n_bg   = min(50, len(X_last))
-    bg     = X_last[:n_bg]               # shape: (50, n_features)
-
-    # FIX 3: Explain only n_samples (consistent 2D shape, no mixing)
+    bg     = X_last[:n_bg]
     n_exp  = min(n_samples, len(X_last))
-    X_exp  = X_last[:n_exp]              # shape: (n_samples, n_features)
+    X_exp  = X_last[:n_exp]
 
     print(f"  Background     : {bg.shape}  (2D — last timestep)")
     print(f"  Explain set    : {X_exp.shape}  (2D — last timestep)")
 
-    # FIX 4: Prediction wrapper — receives 2D from SHAP, reshapes to 3D for model
-    # We repeat the last timestep across the full window so the model gets valid input.
     window_size = X_train.shape[1]
     def predict_from_last_timestep(X_2d):
-        """
-        X_2d : (n, n_features)  — what SHAP passes in (always 2D)
-        We tile it to (n, window_size, n_features) so the LSTM sees a full sequence.
-
-        IMPORTANT: For multi-target models (e.g. [T2M, RH2M, PS]),
-        select ONLY index 0 (T2M) before returning.
-        SHAP requires shape (n,) — one scalar per sample.
-        Flattening all outputs would give (n * n_outputs,) — wrong shape.
-        """
         n = X_2d.shape[0]
         X_3d = np.tile(X_2d[:, np.newaxis, :], (1, window_size, 1))
-        # shape: (n, window_size, n_features) — matches model input exactly
-        preds = model.predict(X_3d, verbose=0)   # (n,) or (n, n_outputs)
-        preds = np.atleast_2d(preds)             # always (n, n_outputs)
-        return preds[:, 0]    # T2M only — shape (n,) as SHAP expects
-    # FIX 5: KernelExplainer with matching 2D background and 2D input
+        preds = model.predict(X_3d, verbose=0)
+        preds = np.atleast_2d(preds)
+        return preds[:, 0]
+
     explainer   = shap.KernelExplainer(predict_from_last_timestep, bg)
     shap_values = explainer.shap_values(X_exp, nsamples=50, silent=True)
 
-    # shap_values shape: (n_samples, n_features) — one value per feature
-    sv         = np.abs(shap_values).mean(axis=0)   # (n_features,)
+    sv         = np.abs(shap_values).mean(axis=0)
     importance = pd.Series(sv, index=feature_names).sort_values(ascending=False)
 
     print("\nFeature Importance (SHAP — last timestep):")
@@ -469,9 +442,10 @@ def explain_with_shap(model, X_train, feature_names, model_type, n_samples=100):
     ax.set_xlabel('Feature')
     plt.xticks(rotation=35, ha='right')
     plt.tight_layout()
-    plt.savefig('shap_importance.png', dpi=120, bbox_inches='tight')
+    os.makedirs('outputs', exist_ok=True)
+    plt.savefig('outputs/shap_importance.png', dpi=120, bbox_inches='tight')
     plt.close()
-    print("SHAP plot saved -> shap_importance.png")
+    print("SHAP plot saved -> outputs/shap_importance.png")
 
 
 # =============================================================================
@@ -499,131 +473,161 @@ def run_pipeline(df_raw, target_cols='T2M', window_size=30,
     print(f"STEP 2: MODEL — {model_type.upper()}  |  outputs={n_outputs}")
     print("=" * 65)
 
-    if TF_AVAILABLE:
-        tf.random.set_seed(SEED)
-        input_shape = (X_train.shape[1], X_train.shape[2])
+    # ── MLflow run starts here ──────────────────────────────────────
+    mlflow.set_experiment("climate-drift-pipeline")
+    with mlflow.start_run(run_name=f"{model_type}_{location_label}"):
+        mlflow.log_param("model_type", model_type)
+        mlflow.log_param("window_size", window_size)
+        mlflow.log_param("location", location_label)
+        mlflow.log_param("target_cols", str(target_cols))
 
-        best_lr, best_bs = (
-            tune_hyperparameters(X_train, y_train, model_type, input_shape, n_outputs)
-            if tune else (1e-3, 32)
-        )
+        if TF_AVAILABLE:
+            tf.random.set_seed(SEED)
+            input_shape = (X_train.shape[1], X_train.shape[2])
 
-        builders = {'lstm': build_lstm_model, 'gru': build_gru_model,
-                    'rnn': build_rnn_model, 'transformer': build_transformer_model}
-        if model_type not in builders:
-            raise ValueError(f"model_type must be one of {list(builders)}")
+            best_lr, best_bs = (
+                tune_hyperparameters(X_train, y_train, model_type, input_shape, n_outputs)
+                if tune else (1e-3, 32)
+            )
 
-        tf.random.set_seed(SEED)
-        model = builders[model_type](input_shape, n_outputs)
-        model.optimizer.learning_rate.assign(best_lr)
-        print(f"Model: {model_type.upper()}  lr={best_lr}  batch={best_bs}")
+            builders = {'lstm': build_lstm_model, 'gru': build_gru_model,
+                        'rnn': build_rnn_model, 'transformer': build_transformer_model}
+            if model_type not in builders:
+                raise ValueError(f"model_type must be one of {list(builders)}")
 
-        ckpt_path = f'best_{model_type}_{location_label}.h5'
-        callbacks = [
-            EarlyStopping(patience=5, restore_best_weights=True),
-            ModelCheckpoint(ckpt_path, save_best_only=True, verbose=0)
-        ]
-        history = model.fit(X_train, y_train,
-                            validation_split=0.1,
-                            epochs=30, batch_size=best_bs,
-                            shuffle=False, callbacks=callbacks, verbose=1)
-        print(f"Checkpoint saved -> {ckpt_path}")
-    else:
-        print("Model: Simple AR (TF not available)")
-        model = SimpleARModel()
-        model.fit(X_train, y_train)
-        history = None
+            tf.random.set_seed(SEED)
+            model = builders[model_type](input_shape, n_outputs)
+            model.optimizer.learning_rate.assign(best_lr)
+            print(f"Model: {model_type.upper()}  lr={best_lr}  batch={best_bs}")
 
-    print("\n" + "=" * 65)
-    print("STEP 3: DRIFT DETECTION & ADAPTIVE RETRAINING")
-    print("=" * 65)
+            mlflow.log_param("learning_rate", best_lr)
+            mlflow.log_param("batch_size", best_bs)
 
-    adwin = ADWINDetector()
-    ph    = PageHinkleyDetector()
-    ddm   = DDMDetector()
+            os.makedirs('outputs', exist_ok=True)
+            ckpt_path = f'outputs/best_{model_type}_{location_label}.h5'
+            callbacks = [
+                EarlyStopping(patience=5, restore_best_weights=True),
+                ModelCheckpoint(ckpt_path, save_best_only=True, verbose=0)
+            ]
+            history = model.fit(X_train, y_train,
+                                validation_split=0.1,
+                                epochs=30, batch_size=best_bs,
+                                shuffle=False, callbacks=callbacks, verbose=1)
+            print(f"Checkpoint saved -> {ckpt_path}")
+        else:
+            print("Model: Simple AR (TF not available)")
+            model = SimpleARModel()
+            model.fit(X_train, y_train)
+            history = None
 
-    MIN_VOTES  = 1
-    MIN_GAP    = 60
-    last_drift = -(10**9)
-    RW         = 400
+        print("\n" + "=" * 65)
+        print("STEP 3: DRIFT DETECTION & ADAPTIVE RETRAINING")
+        print("=" * 65)
 
-    predictions   = []
-    true_values   = []
-    errors        = []
-    drift_events  = []
-    retrain_count = 0
-    detector_hits = {'ADWIN': 0, 'Page-Hinkley': 0, 'DDM': 0}
+        adwin = ADWINDetector()
+        ph    = PageHinkleyDetector()
+        ddm   = DDMDetector()
 
-    print(f"Drift policy : min_votes={MIN_VOTES}, min_gap={MIN_GAP}")
-    print("Running online evaluation ...")
+        MIN_VOTES  = 1
+        MIN_GAP    = 60
+        last_drift = -(10**9)
+        RW         = 400
 
-    for i in range(len(X_test)):
-        if i % 200 == 0:
-            print(f"  {i}/{len(X_test)}  |  Retrains so far: {retrain_count}")
+        predictions   = []
+        true_values   = []
+        errors        = []
+        drift_events  = []
+        retrain_count = 0
+        detector_hits = {'ADWIN': 0, 'Page-Hinkley': 0, 'DDM': 0}
 
-        x_i  = X_test[i:i+1]
-        raw  = model.predict(x_i, verbose=0) if TF_AVAILABLE else model.predict(x_i)
-        pred = np.asarray(raw).reshape(-1)
-        true = np.asarray(y_test[i]).reshape(-1)
+        print(f"Drift policy : min_votes={MIN_VOTES}, min_gap={MIN_GAP}")
+        print("Running online evaluation ...")
 
-        err = float(true[0] - pred[0])
-        predictions.append(pred)
-        true_values.append(true)
-        errors.append(err)
+        for i in range(len(X_test)):
+            if i % 200 == 0:
+                print(f"  {i}/{len(X_test)}  |  Retrains so far: {retrain_count}")
 
-        fired = []
-        if adwin.update(err, i): detector_hits['ADWIN'] += 1;        fired.append('ADWIN')
-        if ph.update(err, i):    detector_hits['Page-Hinkley'] += 1; fired.append('Page-Hinkley')
-        if ddm.update(err, i):   detector_hits['DDM'] += 1;          fired.append('DDM')
+            x_i  = X_test[i:i+1]
+            raw  = model.predict(x_i, verbose=0) if TF_AVAILABLE else model.predict(x_i)
+            pred = np.asarray(raw).reshape(-1)
+            true = np.asarray(y_test[i]).reshape(-1)
 
-        if len(fired) >= MIN_VOTES and (i - last_drift) >= MIN_GAP:
-            print(f"  [Drift @ step {i:4d}]  confirmed by: {', '.join(fired)}")
-            drift_events.append(i)
-            last_drift = i
+            err = float(true[0] - pred[0])
+            predictions.append(pred)
+            true_values.append(true)
+            errors.append(err)
 
-            rX = np.concatenate([X_train[-RW:], X_test[max(0, i-RW):i]])
-            ry = np.concatenate([y_train[-RW:], y_test[max(0, i-RW):i]])
-            model = adaptive_retrain(model, rX, ry, model_type)
-            retrain_count += 1
-            print(f"  Total retrains so far: {retrain_count}")
+            fired = []
+            if adwin.update(err, i): detector_hits['ADWIN'] += 1;        fired.append('ADWIN')
+            if ph.update(err, i):    detector_hits['Page-Hinkley'] += 1; fired.append('Page-Hinkley')
+            if ddm.update(err, i):   detector_hits['DDM'] += 1;          fired.append('DDM')
 
-    print(f"\nTotal drift events : {len(drift_events)}")
-    print(f"Total retrains     : {retrain_count}")
-    print(f"Detector hits      : ADWIN={detector_hits['ADWIN']}, "
-          f"PH={detector_hits['Page-Hinkley']}, DDM={detector_hits['DDM']}")
+            if len(fired) >= MIN_VOTES and (i - last_drift) >= MIN_GAP:
+                print(f"  [Drift @ step {i:4d}]  confirmed by: {', '.join(fired)}")
+                drift_events.append(i)
+                last_drift = i
 
-    predictions = np.array(predictions)
-    true_values = np.array(true_values)
-    n_feat = df_scaled.shape[1]
+                rX = np.concatenate([X_train[-RW:], X_test[max(0, i-RW):i]])
+                ry = np.concatenate([y_train[-RW:], y_test[max(0, i-RW):i]])
+                model = adaptive_retrain(model, rX, ry, model_type)
+                retrain_count += 1
+                print(f"  Total retrains so far: {retrain_count}")
 
-    def inv(vals, col_name):
-        idx   = list(df_scaled.columns).index(col_name)
-        dummy = np.zeros((len(vals), n_feat))
-        dummy[:, idx] = vals
-        return scaler.inverse_transform(dummy)[:, idx]
+        print(f"\nTotal drift events : {len(drift_events)}")
+        print(f"Total retrains     : {retrain_count}")
+        print(f"Detector hits      : ADWIN={detector_hits['ADWIN']}, "
+              f"PH={detector_hits['Page-Hinkley']}, DDM={detector_hits['DDM']}")
 
-    all_metrics = {}
-    for k, tc in enumerate(target_cols):
-        p_orig = inv(predictions[:, k], tc)
-        t_orig = inv(true_values[:,  k], tc)
-        m = compute_metrics(t_orig, p_orig,
-                            label=f"{tc} | {location_label}")
-        all_metrics[tc] = m
+        predictions = np.array(predictions)
+        true_values = np.array(true_values)
+        n_feat = df_scaled.shape[1]
 
-        # SHAP only on first target to save time
-        if k == 0 and TF_AVAILABLE:
-            explain_with_shap(model, X_train,
-                              list(df_scaled.columns), model_type)
+        def inv(vals, col_name):
+            idx   = list(df_scaled.columns).index(col_name)
+            dummy = np.zeros((len(vals), n_feat))
+            dummy[:, idx] = vals
+            return scaler.inverse_transform(dummy)[:, idx]
 
-    final_path = f'final_{model_type}_{location_label}.h5'
-    if TF_AVAILABLE:
-        model.save(final_path)
-        print(f"Final model saved -> {final_path}")
+        all_metrics = {}
+        for k, tc in enumerate(target_cols):
+            p_orig = inv(predictions[:, k], tc)
+            t_orig = inv(true_values[:,  k], tc)
+            m = compute_metrics(t_orig, p_orig,
+                                label=f"{tc} | {location_label}")
+            all_metrics[tc] = m
 
-    p0 = inv(predictions[:, 0], target_cols[0])
-    t0 = inv(true_values[:,  0], target_cols[0])
-    plot_results(t0, p0, errors, drift_events,
-                 adwin, history, target_cols[0], model_type, location_label)
+            # ── Log metrics to MLflow ──────────────────────────────
+            mlflow.log_metric(f"{tc}_mae",      m['mae'])
+            mlflow.log_metric(f"{tc}_rmse",     m['rmse'])
+            mlflow.log_metric(f"{tc}_r2",       m['r2'])
+            mlflow.log_metric(f"{tc}_accuracy", m['accuracy'])
+
+            if k == 0 and TF_AVAILABLE:
+                explain_with_shap(model, X_train,
+                                  list(df_scaled.columns), model_type)
+
+        # Log drift/retrain counts
+        mlflow.log_metric("drift_events",  len(drift_events))
+        mlflow.log_metric("retrain_count", retrain_count)
+
+        # Save and log final model
+        final_path = f'outputs/final_{model_type}_{location_label}.h5'
+        if TF_AVAILABLE:
+            model.save(final_path)
+            print(f"Final model saved -> {final_path}")
+            mlflow.log_artifact(final_path)(model, f"{model_type}_{location_label}_model")
+
+        # Log plot artifact
+        p0 = inv(predictions[:, 0], target_cols[0])
+        t0 = inv(true_values[:,  0], target_cols[0])
+        plot_results(t0, p0, errors, drift_events,
+                     adwin, history, target_cols[0], model_type, location_label)
+
+        plot_file = f'outputs/results_{model_type}_{location_label}.png'
+        if os.path.exists(plot_file):
+            mlflow.log_artifact(plot_file)
+
+    # ── MLflow run ends here ────────────────────────────────────────
 
     return model, scaler, all_metrics, drift_events, retrain_count
 
@@ -693,8 +697,9 @@ def plot_results(trues, preds, errors, drift_events,
         ax6.set_title('Training Loss')
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    fname = (f'results_{model_type}_{loc_label}.png' if loc_label
-             else f'results_{model_type}.png')
+    os.makedirs('outputs', exist_ok=True)
+    fname = (f'outputs/results_{model_type}_{loc_label}.png' if loc_label
+             else f'outputs/results_{model_type}.png')
     plt.savefig(fname, dpi=150, bbox_inches='tight')
     print(f"Figure saved -> {fname}")
     plt.close(fig)
@@ -711,7 +716,7 @@ LOCATIONS = {
 }
 
 
-def run_location_comparison(csv_path=None, model_type='lstm', target_col='T2M'):
+def run_location_comparison(model_type='lstm', target_col='T2M'):
     print("\n" + "=" * 65)
     print("UPGRADE 10: LOCATION-BASED ANALYSIS (Real-time NASA POWER)")
     print("=" * 65)
@@ -720,9 +725,6 @@ def run_location_comparison(csv_path=None, model_type='lstm', target_col='T2M'):
     for loc_name, coords in LOCATIONS.items():
         print(f"\n--- Location: {loc_name} ---")
         df_raw = fetch_nasa_power(lat=coords['lat'], lon=coords['lon'])
-        if df_raw is None and csv_path:
-            print("  Using CSV fallback.")
-            df_raw = load_csv(csv_path)
         if df_raw is None:
             print(f"  Skipping {loc_name} — no data available.")
             continue
@@ -759,8 +761,6 @@ def run_location_comparison(csv_path=None, model_type='lstm', target_col='T2M'):
 
 if __name__ == '__main__':
 
-    CSV_FALLBACK = r'C:\Users\varsh\Downloads\Minor project data.csv'
-
     print("Adaptive Deep Learning Pipeline for Climate Data")
     print("=" * 65)
     print(f"TensorFlow : {TF_AVAILABLE}"
@@ -768,12 +768,10 @@ if __name__ == '__main__':
     print(f"SHAP       : {SHAP_AVAILABLE}")
     print(f"Seed       : {SEED}")
 
-    # Real-time data (default) — falls back to CSV if API unavailable
     df_raw = fetch_nasa_power(lat=28.6, lon=77.2,
                               start='20100101', end='20231231')
     if df_raw is None:
-        print("API unavailable — loading local CSV instead.")
-        df_raw = load_csv(CSV_FALLBACK)
+        raise RuntimeError("NASA POWER API failed — no data available.")
 
     models_to_run = (['lstm', 'gru', 'rnn', 'transformer']
                      if TF_AVAILABLE else ['simple_ar'])
@@ -809,6 +807,7 @@ if __name__ == '__main__':
             'Drifts'     : len(drift_events),
             'Retrains'   : retrain_count,
         })
+
     print("\n" + "=" * 65)
     print("MODEL COMPARISON")
     print("=" * 65)
@@ -820,6 +819,5 @@ if __name__ == '__main__':
     print(f"  Accuracy : {best['Accuracy_%']:.2f}%")
     print(f"  Retrains : {int(best['Retrains'])}")
 
-    # Uncomment for multi-location comparison:
-    run_location_comparison(csv_path=CSV_FALLBACK,model_type='lstm', target_col='T2M')
+    run_location_comparison(model_type='lstm', target_col='T2M')
     print("\nPipeline complete.")
